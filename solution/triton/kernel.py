@@ -398,7 +398,19 @@ def kernel(
     topk_weights_flat = topk_weights.reshape(-1).float()  # [T*8]
 
     # ── 2. Token permutation ───────────────────────────────────────────────
-    BLOCK_M = 64
+    num_slots = T * TOP_K
+
+    # Seq_len-aware BLOCK_M selection (reduces padding waste for small T)
+    if T <= 8:
+        BLOCK_M = 16
+        GROUP_SIZE_M = 1
+    elif T <= 32:
+        BLOCK_M = 32
+        GROUP_SIZE_M = 4
+    else:
+        BLOCK_M = 64
+        GROUP_SIZE_M = 8
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_idx.int(), BLOCK_M, E_GLOBAL,
     )
@@ -409,7 +421,6 @@ def kernel(
     expert_map[local_start:local_start + E_LOCAL] = local_range
     expert_ids_local = expert_map[expert_ids.long()]
 
-    num_slots = T * TOP_K
     EM = sorted_token_ids.shape[0]
     BLOCK_N = 128
     BLOCK_K = 128
@@ -429,12 +440,13 @@ def kernel(
         hidden_states_scale.stride(0), hidden_states_scale.stride(1),
         gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
         BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=BLOCK_N, BLOCK_SIZE_K=BLOCK_K,
-        GROUP_SIZE_M=8, top_k=TOP_K, compute_type=tl.float32,
+        GROUP_SIZE_M=GROUP_SIZE_M, top_k=TOP_K, compute_type=tl.float32,
     )
 
     # ── 4. SwiGLU ──────────────────────────────────────────────────────────
     intermediate2 = torch.empty((num_slots, I), dtype=torch.float32, device=device)
-    SWIGLU_BM, SWIGLU_BN = 64, 64
+    SWIGLU_BM = BLOCK_M
+    SWIGLU_BN = 64
     swiglu_grid = (triton.cdiv(num_slots, SWIGLU_BM), triton.cdiv(I, SWIGLU_BN))
     swiglu_kernel[swiglu_grid](
         intermediate1, intermediate2,
@@ -461,7 +473,7 @@ def kernel(
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
         QUANT_BLOCK=BLOCK,
         BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=BLOCK_N, BLOCK_SIZE_K=BLOCK_K,
-        GROUP_SIZE_M=8, compute_type=tl.float32, MUL_ROUTED_WEIGHT=True,
+        GROUP_SIZE_M=GROUP_SIZE_M, compute_type=tl.float32, MUL_ROUTED_WEIGHT=True,
     )
 
     # ── 6. Reduce: sum over top_k slots per token ─────────────────────────
