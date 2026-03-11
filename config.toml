@@ -1,8 +1,9 @@
 [solution]
-name = "dsa-sparse-attn-triton-v2"
-definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+name = "gdn-prefill-triton-v1"
+definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "DiegoCao"
 
 [build]
 language = "triton"
 entry_point = "kernel.py::kernel"
+destination_passing_style = false

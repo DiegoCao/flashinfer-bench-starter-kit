@@ -1,171 +1,198 @@
 """
-Sparse Attention Kernel v2 (DSA) for FlashInfer MLSys 2026 Contest.
+Gated Delta Net (GDN) Kernels for FlashInfer MLSys 2026 Contest.
 
-Track: sparse_attention (DeepSeek-V3.2 Native Sparse Attention)
-Definition: dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64
-Author: DiegoCao
+Tracks:
+  - gdn_decode_qk4_v8_d128_k_last (batch=1, T=1)
+  - gdn_prefill_qk4_v8_d128_k_last (variable T up to 8192)
 
-V2 optimizations over V1:
-  - exp2-based online softmax (fast math, avoids ln2 multiply)
-  - BLOCK_D=128 → 4 d-tiles instead of 8 (halves logits redundancy)
-  - Pre-loaded q_pe vector (reused every KV chunk iteration)
-  - BLOCK_KV=256 for fewer loop iterations (8 iters vs 16)
+Constants: num_q_heads=4, num_k_heads=4, num_v_heads=8, head_size=128
+GVA mapping: v_head h -> q/k_head h // 2
+State layout: k-last [N, H_V, V, K]
 """
 
+import math
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 
+# =====================================================================
+# GDN Decode Triton Kernel
+# =====================================================================
+
 @triton.jit
-def _sparse_attn_kernel(
-    q_nope_ptr, q_pe_ptr,
-    ckv_flat_ptr, kpe_flat_ptr,
-    sparse_indices_ptr,
-    output_ptr, lse_ptr,
-    sm_scale_log2,  # sm_scale * log2(e)
-    num_tokens,
-    stride_qn_t, stride_qn_h,
-    stride_qp_t, stride_qp_h,
-    stride_o_t, stride_o_h,
-    stride_lse_t, stride_lse_h,
-    BLOCK_KV: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    HEAD_DIM_CKV: tl.constexpr,
-    HEAD_DIM_KPE: tl.constexpr,
-    TOPK: tl.constexpr,
-    NUM_D_TILES: tl.constexpr,
+def _gdn_decode_kernel(
+    q_ptr, k_ptr, v_ptr,
+    state_ptr, output_ptr, new_state_ptr,
+    g_ptr, beta_ptr,
+    scale,
+    stride_qk_b, stride_qk_h,
+    stride_v_b, stride_v_h,
+    stride_s_b, stride_s_h, stride_s_v,
+    stride_o_b, stride_o_h,
+    BLOCK_V: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
 ):
-    """
-    One program per (token, head, d_tile).
-    Logits computed once per KV chunk (tiled over CKV+KPE dims).
-    Output accumulated for this d_tile only.
-    Uses exp2 for fast softmax.
-    """
-    token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-    d_tile_id = tl.program_id(2)
+    pid_bh = tl.program_id(0)
+    pid_v = tl.program_id(1)
 
-    d_out_start = d_tile_id * BLOCK_D
-    si_base = sparse_indices_ptr + token_id * TOPK
+    b_idx = pid_bh // NUM_V_HEADS
+    h_v = pid_bh % NUM_V_HEADS
+    h_qk = h_v * NUM_Q_HEADS // NUM_V_HEADS
 
-    # Online softmax state
-    m_i = -float("inf")
-    l_i = 0.0
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    v_start = pid_v * BLOCK_V
+    v_offs = v_start + tl.arange(0, BLOCK_V)
+    k_offs = tl.arange(0, HEAD_SIZE)
 
-    # Pre-load q_pe (64-dim, stays in registers across all KV chunks)
-    d_offs_kpe = tl.arange(0, HEAD_DIM_KPE)
-    q_pe_vec = tl.load(
-        q_pe_ptr + token_id * stride_qp_t + head_id * stride_qp_h + d_offs_kpe
-    ).to(tl.float32)
+    g_val = tl.load(g_ptr + b_idx * NUM_V_HEADS + h_v)
+    beta_val = tl.load(beta_ptr + b_idx * NUM_V_HEADS + h_v)
 
-    for kv_start in range(0, TOPK, BLOCK_KV):
-        kv_offs = kv_start + tl.arange(0, BLOCK_KV)
-        kv_mask = kv_offs < TOPK
+    k_vec = tl.load(k_ptr + b_idx * stride_qk_b + h_qk * stride_qk_h + k_offs).to(tl.float32)
+    q_vec = tl.load(q_ptr + b_idx * stride_qk_b + h_qk * stride_qk_h + k_offs).to(tl.float32)
+    v_tile = tl.load(v_ptr + b_idx * stride_v_b + h_v * stride_v_h + v_offs).to(tl.float32)
 
-        indices = tl.load(si_base + kv_offs, mask=kv_mask, other=-1)
-        valid_mask = (indices != -1) & kv_mask
-        indices_i64 = indices.to(tl.int64)
+    s_base = state_ptr + b_idx * stride_s_b + h_v * stride_s_h
+    s_offsets = v_offs[:, None] * stride_s_v + k_offs[None, :]
+    state_tile = tl.load(s_base + s_offsets)
 
-        # ---- Compute logits [BLOCK_KV] ----
-        logits = tl.zeros([BLOCK_KV], dtype=tl.float32)
+    g_state = g_val * state_tile
+    old_v = tl.sum(g_state * k_vec[None, :], axis=1)
+    delta_v = beta_val * (v_tile - old_v)
+    new_state_tile = g_state + delta_v[:, None] * k_vec[None, :]
 
-        # CKV dot product (tiled over head_dim in BLOCK_D chunks)
-        for d_start in tl.static_range(0, HEAD_DIM_CKV, BLOCK_D):
-            d_offs = d_start + tl.arange(0, BLOCK_D)
-            q_chunk = tl.load(
-                q_nope_ptr + token_id * stride_qn_t + head_id * stride_qn_h + d_offs
-            ).to(tl.float32)
-            k_addrs = indices_i64[:, None] * HEAD_DIM_CKV + d_offs[None, :]
-            k_chunk = tl.load(
-                ckv_flat_ptr + k_addrs,
-                mask=valid_mask[:, None], other=0.0
-            ).to(tl.float32)
-            logits += tl.sum(q_chunk[None, :] * k_chunk, axis=1)
+    ns_base = new_state_ptr + b_idx * stride_s_b + h_v * stride_s_h
+    tl.store(ns_base + s_offsets, new_state_tile)
 
-        # KPE dot product (single tile, 64-dim)
-        kp_addrs = indices_i64[:, None] * HEAD_DIM_KPE + d_offs_kpe[None, :]
-        kp_chunk = tl.load(
-            kpe_flat_ptr + kp_addrs,
-            mask=valid_mask[:, None], other=0.0
-        ).to(tl.float32)
-        logits += tl.sum(q_pe_vec[None, :] * kp_chunk, axis=1)
-
-        # Scale (in log2 space) and mask
-        logits = logits * sm_scale_log2
-        logits = tl.where(valid_mask, logits, -float("inf"))
-
-        # ---- Online softmax with exp2 ----
-        m_new = tl.maximum(m_i, tl.max(logits, axis=0))
-        alpha = tl.math.exp2(m_i - m_new)
-        p = tl.math.exp2(logits - m_new)
-        p = tl.where(valid_mask, p, 0.0)
-        l_new = l_i * alpha + tl.sum(p, axis=0)
-        acc = acc * alpha
-
-        # ---- Accumulate output d_tile [BLOCK_D] ----
-        d_offs_out = d_out_start + tl.arange(0, BLOCK_D)
-        kc_addrs = indices_i64[:, None] * HEAD_DIM_CKV + d_offs_out[None, :]
-        kc_chunk = tl.load(
-            ckv_flat_ptr + kc_addrs,
-            mask=valid_mask[:, None], other=0.0
-        ).to(tl.float32)
-        acc += tl.sum(p[:, None] * kc_chunk, axis=0)
-
-        m_i = m_new
-        l_i = l_new
-
-    # Finalize
-    acc = acc / l_i
-
-    # Write output tile
-    d_offs_out = d_out_start + tl.arange(0, BLOCK_D)
-    out_ptrs = output_ptr + token_id * stride_o_t + head_id * stride_o_h + d_offs_out
-    tl.store(out_ptrs, acc.to(tl.bfloat16))
-
-    # Write LSE (only from d_tile_id == 0)
-    if d_tile_id == 0:
-        # LSE in base 2: log2(l_i) + m_i (m_i already in log2 space)
-        lse_val = tl.log2(l_i) + m_i
-        tl.store(lse_ptr + token_id * stride_lse_t + head_id * stride_lse_h, lse_val)
+    output_v = scale * tl.sum(new_state_tile * q_vec[None, :], axis=1)
+    o_base = output_ptr + b_idx * stride_o_b + h_v * stride_o_h
+    tl.store(o_base + v_offs, output_v.to(tl.bfloat16))
 
 
-def kernel(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse):
-    num_tokens = q_nope.shape[0]
-    HEAD_DIM_CKV = 512
-    HEAD_DIM_KPE = 64
-    TOPK = 2048
-    NUM_QO_HEADS = 16
-    LOG2E = 1.4426950408889634
+def gdn_decode(q, k, v, state, A_log, a, dt_bias, b, scale):
+    B, T, num_q_heads, K = q.shape
+    num_v_heads = v.shape[2]
+    V = v.shape[3]
+    device = q.device
 
-    ckv_flat = ckv_cache.reshape(-1, HEAD_DIM_CKV)
-    kpe_flat = kpe_cache.reshape(-1, HEAD_DIM_KPE)
-    sm_scale_log2 = sm_scale * LOG2E
+    if scale is None or scale == 0.0:
+        scale = 1.0 / math.sqrt(K)
 
-    BLOCK_KV = 256
+    x = a.float() + dt_bias.float()
+    g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x)).squeeze(1)
+    beta = torch.sigmoid(b.float()).squeeze(1)
 
-    # Adaptive BLOCK_D: more d_tiles for small batches (parallelism),
-    # fewer for large batches (less redundant logits computation)
-    if num_tokens <= 2:
-        BLOCK_D = 64
-    else:
-        BLOCK_D = 128
-    NUM_D_TILES = HEAD_DIM_CKV // BLOCK_D
+    q_2d = q.squeeze(1).contiguous()
+    k_2d = k.squeeze(1).contiguous()
+    v_2d = v.squeeze(1).contiguous()
 
-    grid = (num_tokens, NUM_QO_HEADS, NUM_D_TILES)
+    if state is None:
+        state = torch.zeros(B, num_v_heads, V, K, dtype=torch.float32, device=device)
 
-    _sparse_attn_kernel[grid](
-        q_nope, q_pe,
-        ckv_flat, kpe_flat,
-        sparse_indices,
-        output, lse,
-        sm_scale_log2, num_tokens,
-        q_nope.stride(0), q_nope.stride(1),
-        q_pe.stride(0), q_pe.stride(1),
+    output = torch.empty(B, num_v_heads, V, dtype=torch.bfloat16, device=device)
+    new_state = torch.empty_like(state)
+
+    BLOCK_V = 32
+    NUM_V_TILES = V // BLOCK_V
+    grid = (B * num_v_heads, NUM_V_TILES)
+
+    _gdn_decode_kernel[grid](
+        q_2d, k_2d, v_2d,
+        state, output, new_state,
+        g, beta, scale,
+        q_2d.stride(0), q_2d.stride(1),
+        v_2d.stride(0), v_2d.stride(1),
+        state.stride(0), state.stride(1), state.stride(2),
         output.stride(0), output.stride(1),
-        lse.stride(0), lse.stride(1),
-        BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D,
-        HEAD_DIM_CKV=HEAD_DIM_CKV, HEAD_DIM_KPE=HEAD_DIM_KPE,
-        TOPK=TOPK, NUM_D_TILES=NUM_D_TILES,
+        BLOCK_V=BLOCK_V, HEAD_SIZE=K,
+        NUM_V_HEADS=num_v_heads, NUM_Q_HEADS=num_q_heads,
     )
+
+    output = output.unsqueeze(1)
+    return output, new_state
+
+
+def _matmul(a, b):
+    return a.float() @ b.float()
+
+
+def gdn_prefill(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
+    """GDN prefill — exact copy of reference implementation."""
+    total_seq_len, num_q_heads, head_size = q.shape
+    num_v_heads = v.shape[1]
+    num_k_heads = k.shape[1]
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    num_seqs = cu_seqlens.size(0) - 1
+    device = q.device
+
+    if scale is None or scale == 0.0:
+        scale = 1.0 / math.sqrt(head_size)
+
+    # Compute g and beta from raw parameters
+    x = a.float() + dt_bias.float()  # [total_seq_len, HV]
+    g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [total_seq_len, HV]
+    beta = torch.sigmoid(b.float())  # [total_seq_len, HV]
+
+    q_exp = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)
+    k_exp = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)
+
+    output = torch.zeros(
+        (total_seq_len, num_sab_heads, head_size), dtype=torch.bfloat16, device=device
+    )
+    new_state = torch.zeros(
+        (num_seqs, num_sab_heads, head_size, head_size), dtype=torch.float32, device=device
+    )
+
+    for seq_idx in range(num_seqs):
+        seq_start = int(cu_seqlens[seq_idx].item())
+        seq_end = int(cu_seqlens[seq_idx + 1].item())
+        seq_len = seq_end - seq_start
+
+        if seq_len <= 0:
+            continue
+
+        if state is not None:
+            state_HKV = state[seq_idx].clone().float().transpose(-1, -2)  # [H,V,K] -> [H,K,V]
+        else:
+            state_HKV = torch.zeros(
+                (num_sab_heads, head_size, head_size), dtype=torch.float32, device=device
+            )
+
+        for i in range(seq_len):
+            t = seq_start + i
+            q_H1K = q_exp[t].unsqueeze(1).float()
+            k_H1K = k_exp[t].unsqueeze(1).float()
+            v_H1V = v[t].unsqueeze(1).float()
+            g_H11 = g[t].unsqueeze(1).unsqueeze(2)
+            beta_H11 = beta[t].unsqueeze(1).unsqueeze(2)
+
+            old_state_HKV = g_H11 * state_HKV
+            old_v_H1V = _matmul(k_H1K, old_state_HKV)
+            new_v_H1V = beta_H11 * v_H1V + (1 - beta_H11) * old_v_H1V
+            state_remove = torch.einsum('hkl,hlv->hkv', k_H1K.transpose(-1, -2), old_v_H1V)
+            state_update = torch.einsum('hkl,hlv->hkv', k_H1K.transpose(-1, -2), new_v_H1V)
+            state_HKV = old_state_HKV - state_remove + state_update
+
+            o_H1V = scale * _matmul(q_H1K, state_HKV)
+            output[t] = o_H1V.squeeze(1).to(torch.bfloat16)
+
+        new_state[seq_idx] = state_HKV.transpose(-1, -2)  # [H,K,V] -> [H,V,K]
+
+    return output, new_state
+
+
+# =====================================================================
+# Entry Point
+# =====================================================================
+
+def kernel(q, k, v, state, A_log, a, dt_bias, b, *args):
+    if len(args) == 1:
+        scale = args[0]
+        return gdn_decode(q, k, v, state, A_log, a, dt_bias, b, scale)
+    elif len(args) == 2:
+        cu_seqlens, scale = args
+        return gdn_prefill(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+    else:
+        raise ValueError(f"Expected 9 or 10 arguments, got {8 + len(args)}")
