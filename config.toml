@@ -1,9 +1,8 @@
 [solution]
-name = "fused-moe-triton-v5"
-definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+name = "dsa-sparse-attn-triton-v2"
+definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
 author = "DiegoCao"
 
 [build]
 language = "triton"
 entry_point = "kernel.py::kernel"
-destination_passing_style = true
